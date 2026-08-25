@@ -1,0 +1,16 @@
+services:
+  model-agent-ui:
+    build: .
+    container_name: model-agent-ui
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      MODEL_AGENT_API_URL: http://model-agent-api:8500
+    networks:
+      - gpu_panel_net
+
+networks:
+  gpu_panel_net:
+    name: gpu_control_panel_default
+    external: true
