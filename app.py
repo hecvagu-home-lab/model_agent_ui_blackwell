@@ -15,6 +15,7 @@ import httpx
 import streamlit as st
 from typing import List, Dict, Optional
 import json
+import pandas as pd
 
 API_URL = os.getenv("MODEL_AGENT_API_URL", "http://model-agent-api:8500").rstrip("/")
 
@@ -38,7 +39,7 @@ def api_get(path: str, **kwargs):
 
 def api_post(path: str, json: dict = None, timeout: float = 600.0):
     """
-    Sends POST request to model-agent-api. 
+    Sends POST request to model-agent-api.
     Default timeout set to 600 seconds (10 minutes) for large model downloads.
     """
     return httpx.post(f"{API_URL}{path}", json=json, timeout=timeout)
@@ -64,16 +65,66 @@ def get_subfolders(backend: str, placement_root: str, fallback: List[str]) -> Li
     return st.session_state[cache_key]
 
 
+def _build_artifact_table(discovered_artifacts, backend, comfy_subfolder, dest_options_by_backend):
+    """
+    Turns the raw discovered_artifacts list into a DataFrame shaped for
+    st.data_editor: one row per artifact, id kept as a hidden column for
+    lookups, name/size/type shown read-only, select + destination editable.
+    """
+    rows = []
+    for artifact in discovered_artifacts:
+        artifact_id = artifact.get("id")
+        artifact_name = artifact.get("name", "unknown")
+        name_lower = artifact_name.lower()
+
+        suggested_folder = "checkpoints"
+        if "taeh3" in name_lower or "taesd" in name_lower or "vae_approx" in name_lower:
+            suggested_folder = "vae_approx"
+        elif "vae" in name_lower:
+            suggested_folder = "vae"
+        elif "encoder" in name_lower or "clip" in name_lower or "text" in name_lower:
+            suggested_folder = "text_encoders"
+        elif "lora" in name_lower or "turbo" in name_lower:
+            suggested_folder = "loras"
+        elif "diffusion" in name_lower or "unet" in name_lower:
+            suggested_folder = "diffusion_models"
+
+        if backend == "comfyui":
+            default_dest = suggested_folder if suggested_folder != "checkpoints" else comfy_subfolder
+        else:
+            default_dest = suggested_folder
+
+        rows.append({
+            "id": artifact_id,
+            "Select": False,
+            "Artifact Name": artifact_name,
+            "Type": artifact.get("artifact_type", artifact.get("type", "unknown")),
+            "Size": _human_size(artifact.get("size_bytes", 0)),
+            "Destination Folder": default_dest,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _status_label(repo_id: str, artifact_id: str) -> str:
+    key = f"{repo_id}_{artifact_id}"
+    status = st.session_state.download_status.get(key)
+    return {
+        "downloading": "⬇️ Downloading",
+        "completed": "✅ Done",
+        "error": "❌ Error",
+    }.get(status, "⏳ Pending")
+
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def _sync_artifacts(repo_id: str, artifacts: Dict[str, str], backend: str, placement_root: str, subfolders: Dict[str, str] = None):
+def _sync_artifacts(repo_id, artifacts, backend, placement_root, subfolders=None, status_placeholder=None, base_table=None):
     """
-    Sincroniza artifacts asociando cada uno a su subcarpeta correspondiente.
-    `artifacts` maps artifact_id -> artifact_name. Names may repeat within
-    a repo (e.g. multiple units each having a config.json); id is what's
-    guaranteed unique.
+    artifacts: dict mapping artifact_id -> artifact_name. Names may repeat
+    within a repo (e.g. multiple units each having a config.json); id is
+    what's guaranteed unique, so all lookups here go through id.
     """
     subfolders = subfolders or {}
 
@@ -81,13 +132,16 @@ def _sync_artifacts(repo_id: str, artifacts: Dict[str, str], backend: str, place
         for artifact_id, name in artifacts.items():
             key = f"{repo_id}_{artifact_id}"
             st.session_state.download_status[key] = "downloading"
+            if status_placeholder is not None and base_table is not None:
+                live_table = base_table.copy()
+                live_table["Status"] = live_table["id"].apply(lambda aid: _status_label(repo_id, aid))
+                status_placeholder.dataframe(live_table.drop(columns=["id"]), hide_index=True, width="stretch")
 
             target_subfolder = subfolders.get(artifact_id, "")
             final_placement = os.path.join(placement_root, target_subfolder).rstrip("/")
-
             payload = {
                 "repo_id": repo_id,
-                "artifacts": [artifact_id],   # was [name] — model-manager now filters by id
+                "artifacts": [artifact_id],
                 "backend": backend,
                 "placement_root": final_placement,
             }
@@ -96,13 +150,17 @@ def _sync_artifacts(repo_id: str, artifacts: Dict[str, str], backend: str, place
                 resp = api_post(f"/discover/{repo_id}/sync-batch", json=payload)
                 if resp.status_code < 400:
                     st.session_state.download_status[key] = "completed"
-                    st.session_state.download_progress[key] = 100
                 else:
                     st.session_state.download_status[key] = "error"
                     st.error(f"Error syncing {name}: {resp.text}")
             except Exception as e:
                 st.session_state.download_status[key] = "error"
                 st.error(f"Exception syncing {name}: {e}")
+
+            if status_placeholder is not None and base_table is not None:
+                live_table = base_table.copy()
+                live_table["Status"] = live_table["id"].apply(lambda aid: _status_label(repo_id, aid))
+                status_placeholder.dataframe(live_table.drop(columns=["id"]), hide_index=True, width="stretch")
 
         st.success("✅ Sync batch complete!")
         st.rerun()
@@ -201,7 +259,7 @@ with tab_sync:
 
     st.subheader("📦 Sync Artifacts from MinIO to Backend")
     st.caption("Discover available artifacts from MinIO, select which ones to download, and sync to your backend.")
-    
+
     if 'download_status' not in st.session_state:
         st.session_state.download_status = {}
     if 'download_progress' not in st.session_state:
@@ -210,9 +268,9 @@ with tab_sync:
         st.session_state.selected_artifacts = []
     if 'discovered_artifacts' not in st.session_state:
         st.session_state.discovered_artifacts = []
-    
+
     col_backend, col_repo, col_discover = st.columns([2, 3, 2])
-    
+
     with col_backend:
         backend = st.selectbox(
             "🎯 Backend",
@@ -221,7 +279,7 @@ with tab_sync:
         )
         default_root = "/opt/models/comfyui" if backend == "comfyui" else "/opt/models/vllm"
         placement_root = st.text_input("📁 Placement root", value=default_root, key="sync_root")
-    
+
     with col_repo:
         repo_id = st.text_input(
             "📦 Repo ID (HuggingFace format)",
@@ -229,7 +287,7 @@ with tab_sync:
             key="sync_repo_id",
             help="Format: organization/repo_name"
         )
-    
+
     with col_discover:
         st.write("")
         st.write("")
@@ -250,11 +308,11 @@ with tab_sync:
                             st.error(f"Error {resp.status_code}: {resp.text}")
                     except Exception as e:
                         st.error(f"Discovery failed: {e}")
-    
+
     if st.session_state.discovered_artifacts:
         st.divider()
         st.subheader(f"📋 Artifacts in {repo_id}")
-        
+
         comfy_subfolder = None
         if backend == "comfyui":
             comfy_fallback_options = ["checkpoints", "diffusion_models", "loras", "vae", "vae_approx", "clip", "text_encoders", "unet", "controlnet", "embeddings"]
@@ -266,110 +324,66 @@ with tab_sync:
                 index=default_index,
                 key="comfy_subfolder_default"
             )
-        
+
         st.write("### Select artifacts to sync:")
-        
-        col_select, col_artifact, col_size, col_dest, col_status = st.columns([0.5, 3, 1, 2, 1.5])
-        with col_select:
-            st.write("**Select**")
-        with col_artifact:
-            st.write("**Artifact Name**")
-        with col_size:
-            st.write("**Size**")
-        with col_dest:
-            st.write("**Destination Folder**")
-        with col_status:
-            st.write("**Status**")
-        
+
+        # Destination folder choices — same source as before (real subfolders from
+        # the API, falling back to a hardcoded list), just computed once up front
+        # instead of per-row.
+        fallback_options = (
+            ["checkpoints", "diffusion_models", "loras", "vae", "vae_approx", "clip", "text_encoders", "unet", "controlnet", "embeddings"]
+            if backend == "comfyui" else ["models", "weights", "checkpoints"]
+        )
+        dest_options = get_subfolders(backend, placement_root, fallback_options)
+
+        artifact_table = _build_artifact_table(
+            st.session_state.discovered_artifacts,
+            backend=backend,
+            comfy_subfolder=comfy_subfolder,
+            dest_options_by_backend=dest_options,
+        )
+
+        edited_table = st.data_editor(
+            artifact_table,
+            hide_index=True,
+            width="stretch",
+            disabled=["Artifact Name", "Type", "Size", "Status"],
+            column_order=["Select", "Artifact Name", "Type", "Size", "Destination Folder", "Status"],
+            column_config={
+                "id": None,  # hides the id column from display while keeping it in the data
+                "Select": st.column_config.CheckboxColumn("Select", width="small"),
+                "Artifact Name": st.column_config.TextColumn("Artifact Name", width="large"),
+                "Type": st.column_config.TextColumn("Type", width="small"),
+                "Size": st.column_config.TextColumn("Size", width="small"),
+                "Destination Folder": st.column_config.SelectboxColumn(
+                    "Destination Folder",
+                    options=dest_options,
+                    width="medium",
+                ),
+            },
+            key=f"artifact_editor_{repo_id}",
+        )
+
+        edited_table["Status"] = edited_table["id"].apply(lambda aid: _status_label(repo_id, aid))
+
+        # Rebuild selection + destination state from the edited table, keyed by
+        # artifact id (never by name — two artifacts in the same repo can share
+        # a filename, e.g. config.json across multiple units).
+        selected_rows = edited_table[edited_table["Select"] == True]
+
+        st.session_state.selected_artifacts = [
+            f"{repo_id}_{aid}" for aid in selected_rows["id"].tolist()
+        ]
+
+        selected_subfolders = dict(zip(edited_table["id"], edited_table["Destination Folder"]))
+
         st.divider()
-        
-        for idx, artifact in enumerate(st.session_state.discovered_artifacts):
-            artifact_name = artifact.get("name", "unknown")
-            artifact_id = artifact.get("id")
-            if not artifact_id:
-                # Fallback for any artifact payload missing an id — keeps old
-                # behavior (and the same crash risk) only in that edge case.
-                artifact_id = f"{artifact_name}_{idx}"
-            artifact_key = f"{repo_id}_{artifact_id}"
-            artifact_size = artifact.get("size_bytes", 0)
-            artifact_type = artifact.get("artifact_type", artifact.get("type", "unknown"))
-            
-            # Mapeo inteligente con prioridad a vae_approx para modelos TAESD
-            suggested_folder = "checkpoints"
-            name_lower = artifact_name.lower()
-            if "taeh3" in name_lower or "taesd" in name_lower or "vae_approx" in name_lower:
-                suggested_folder = "vae_approx"
-            elif "vae" in name_lower:
-                suggested_folder = "vae"
-            elif "encoder" in name_lower or "clip" in name_lower or "text" in name_lower:
-                suggested_folder = "text_encoders"
-            elif "lora" in name_lower or "turbo" in name_lower:
-                suggested_folder = "loras"
-            elif "diffusion" in name_lower or "unet" in name_lower:
-                suggested_folder = "diffusion_models"
-            
-            if backend == "comfyui":
-                default_dest = suggested_folder if suggested_folder != "checkpoints" else comfy_subfolder
-            else:
-                default_dest = suggested_folder
-            
-            c_select, c_artifact, c_size, c_dest, c_status = st.columns([0.5, 3, 1, 2, 1.5])
-            
-            with c_select:
-                is_selected = st.checkbox(
-                    f"Select {artifact_name}",
-                    key=f"sel_{artifact_key}",
-                    value=artifact_key in st.session_state.selected_artifacts,
-                    label_visibility="collapsed"
-                )
-                if is_selected and artifact_key not in st.session_state.selected_artifacts:
-                    st.session_state.selected_artifacts.append(artifact_key)
-                elif not is_selected and artifact_key in st.session_state.selected_artifacts:
-                    st.session_state.selected_artifacts.remove(artifact_key)
-            
-            with c_artifact:
-                st.write(f"**{artifact_name}**")
-                st.caption(f"Type: {artifact_type}")
-            
-            with c_size:
-                st.write(_human_size(artifact_size))
-                        
-            with c_dest:
-                fallback_options = (
-                    ["checkpoints", "diffusion_models", "loras", "vae", "vae_approx", "clip", "text_encoders", "unet", "controlnet", "embeddings"]
-                    if backend == "comfyui" else ["models", "weights", "checkpoints"]
-                )
-                dest_options = get_subfolders(backend, placement_root, fallback_options)
 
-            dest_key = f"dest_{artifact_key}"
-            if dest_key not in st.session_state:
-                st.session_state[dest_key] = default_dest
+        # Must exist before either sync button below can reference it.
+        status_placeholder = st.empty()
 
-            chosen_folder = st.selectbox(
-                f"Destination for {artifact_name}",
-                dest_options,
-                key=dest_key,
-                label_visibility="collapsed"
-            )
-            selected_subfolders[artifact_id] = chosen_folder
-
-            with c_status:
-                if artifact_key in st.session_state.download_status:
-                    status = st.session_state.download_status[artifact_key]
-                    if status == "completed":
-                        st.success("✅ Done")
-                    elif status == "downloading":
-                        progress = st.session_state.download_progress.get(artifact_key, 0)
-                        st.progress(progress, text=f"{progress}%")
-                    elif status == "error":
-                        st.error("❌ Error")
-                else:
-                    st.write("⏳ Pending")
-        
-        st.divider()
-        
         col_sync_all, col_sync_selected, col_status_info = st.columns([1, 1, 2])
-        
+
         with col_sync_all:
             if st.button("📥 Sync All Artifacts", type="primary", width="stretch"):
                 all_artifacts = {
@@ -383,11 +397,13 @@ with tab_sync:
                         artifacts=all_artifacts,
                         backend=backend,
                         placement_root=placement_root,
-                        subfolders=selected_subfolders
+                        subfolders=selected_subfolders,
+                        status_placeholder=status_placeholder,
+                        base_table=edited_table,
                     )
                 else:
                     st.warning("No artifacts to sync")
-        
+
         with col_sync_selected:
             if st.button("📥 Sync Selected", type="primary", width="stretch"):
                 if st.session_state.selected_artifacts:
@@ -401,14 +417,16 @@ with tab_sync:
                         artifacts=selected_artifacts_map,
                         backend=backend,
                         placement_root=placement_root,
-                        subfolders=selected_subfolders
+                        subfolders=selected_subfolders,
+                        status_placeholder=status_placeholder,
+                        base_table=edited_table,
                     )
                 else:
                     st.warning("No artifacts selected")
-        
+
         with col_status_info:
             st.caption("💡 Select artifacts using the checkboxes, then click 'Sync Selected'")
-    
+
     else:
         st.info("👆 Enter a Repo ID and click 'Discover from MinIO' to see available artifacts")
 
