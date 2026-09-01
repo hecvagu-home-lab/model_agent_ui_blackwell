@@ -116,6 +116,56 @@ def _status_label(repo_id: str, artifact_id: str) -> str:
     }.get(status, "⏳ Pending")
 
 
+def _check_existing_locations(repo_id, placement_root, backend, table):
+    """
+    Asks model-agent-api where each artifact's file already lives on
+    disk, if anywhere. Returns {artifact_id: subfolder_or_None}.
+    subfolder is "" if the file sits directly in placement_root.
+    """
+    items = [
+        {
+            "artifact_id": row["id"],
+            "filename": row["Artifact Name"],
+            "subfolder": row["Destination Folder"],
+        }
+        for _, row in table.iterrows()
+        if row["id"]
+    ]
+    if not items:
+        return {}
+    try:
+        resp = httpx.post(
+            f"{API_URL}/files/check-existing",
+            json={"placement_root": placement_root, "items": items},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        return resp.json().get("results", {})
+    except Exception:
+        # Best-effort hint only — if the check fails, leave destinations
+        # and On Disk status as originally guessed rather than blocking
+        # the table from rendering.
+        return {}
+
+
+def _resolve_destination(row, found_locations):
+    """
+    If the file was found on disk somewhere, use that real location as
+    the Destination Folder instead of the naming-heuristic guess. "" means
+    found directly in placement_root; None means not found at all.
+    """
+    found = found_locations.get(row["id"])
+    if found is not None:
+        return found if found != "" else "(root)"
+    return row["Destination Folder"]
+
+
+
+def _on_backend_change():
+    new_backend = st.session_state["sync_backend"]
+    st.session_state["sync_root"] = "/opt/models/comfyui" if new_backend == "comfyui" else "/opt/models/vllm"
+
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
@@ -275,7 +325,8 @@ with tab_sync:
         backend = st.selectbox(
             "🎯 Backend",
             ["comfyui", "vllm"],
-            key="sync_backend"
+            key="sync_backend",
+            on_change=_on_backend_change,
         )
         default_root = "/opt/models/comfyui" if backend == "comfyui" else "/opt/models/vllm"
         placement_root = st.text_input("📁 Placement root", value=default_root, key="sync_root")
@@ -343,12 +394,26 @@ with tab_sync:
             dest_options_by_backend=dest_options,
         )
 
+        # Must run before dest_options / Destination Folder are finalized below —
+        # both depend on knowing where files were actually found on disk.
+        found_locations = _check_existing_locations(repo_id, placement_root, backend, artifact_table)
+
+        # Make sure any auto-detected location is selectable even if it wasn't
+        # in the discovered/fallback subfolder list.
+        found_subfolders = {v if v else "(root)" for v in found_locations.values() if v is not None}
+        dest_options = sorted(set(dest_options) | found_subfolders)
+
+        artifact_table["Destination Folder"] = artifact_table.apply(_resolve_destination, axis=1, args=(found_locations,))
+        artifact_table["On Disk"] = artifact_table["id"].apply(
+            lambda aid: "✅ Yes" if found_locations.get(aid) is not None else ("❓ Unknown" if aid not in found_locations else "— No")
+        )
+
         edited_table = st.data_editor(
             artifact_table,
             hide_index=True,
             width="stretch",
-            disabled=["Artifact Name", "Type", "Size", "Status"],
-            column_order=["Select", "Artifact Name", "Type", "Size", "Destination Folder", "Status"],
+            disabled=["Artifact Name", "Type", "Size", "On Disk", "Status"],
+            column_order=["Select", "Artifact Name", "Type", "Size", "Destination Folder", "On Disk", "Status"],
             column_config={
                 "id": None,  # hides the id column from display while keeping it in the data
                 "Select": st.column_config.CheckboxColumn("Select", width="small"),
@@ -360,6 +425,7 @@ with tab_sync:
                     options=dest_options,
                     width="medium",
                 ),
+                "On Disk": st.column_config.TextColumn("On Disk", width="small"),
             },
             key=f"artifact_editor_{repo_id}",
         )
